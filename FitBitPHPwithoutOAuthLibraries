@@ -1,0 +1,347 @@
+<?php
+/*
+	Author: Meade Rubenstein
+	Website: MobileTextHealth.com
+	Code based on: http://hannah.wf/twitter-oauth-simple-curl-requests-for-your-own-data/
+	
+	This version transforms the Twitter open source code to be used for FitBit.  This version of the code removes specific functions for my site and does 
+	not have ALL of the error trapping and checks a true commecial product should.  Feel free to contact me with any questions rubenstein.meade@gmail.com
+	
+	OpenSource License: MIT
+	Copyright (c) <2015> <Meade Rubenstein>
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+Here's the complete OAuth flow: https://wiki.fitbit.com/display/API/OAuth+Authentication+in+the+Fitbit+API#OAuthAuthenticationintheFitbitAPI-TheOAuthFlow
+It took some time finding code that didn't use other php libraries and relied on only curl calls.  I copied some code from the Twitter OAuth code (mentioned above)
+did a lot of debugging, research, etc. to provide the solution below.  NO EXTERNAL LIBRARIES are needed for this solution (outside of the CodeIgniter framework
+that was used as a general Php framework and not directly for the FitBit OAuth process.
+
+The OAUTH steps begin:
+STEP 1 - The client acquires a key and secret from Fitbit by registering an application at dev.fitbit.com.
+STEP 2 - The client builds an application which uses content from Fitbit.
+STEP 3 - The user requests to view content in the client application.
+*/	
+
+// this code was build on CodeIgniter v3.x, you can easily modify it to run outside of the framework
+class Fitbit extends CI_Controller {
+	
+	function __construct() {
+		parent::__construct();
+
+		// load needed codeigniter modules
+		$this->load->model(array('User_model', 'Fitbit_model'));
+		$this->load->helper(array('html','form', 'url', 'date'));
+		
+		// set class constants
+		$this->consumer_key = "place your fitbit consumer key here";
+		$this->consumer_secret = "place your fitbit consumer secret here";
+		
+	}
+	
+	public function index() {
+	}
+//---------------------------------------------------------------------------------------------------------
+// -- OAUTH STEP 4 in the FitBit OAuth flow - The client requests and receives temporary credentials from Fitbit. A and B
+//---------------------------------------------------------------------------------------------------------	
+	function get_fitbit_user($userid) {
+		//get temp access - see function below
+		$temp = $this->get_oauth_tempaccess();
+		
+		//move data to array
+		parse_str($temp, $results);
+		//print_r($results);
+		
+		//add token/secret to database
+		//the tokens will be used in step 2, the oauth_token is used when FitBit uses your return url so you can match what they send - both of these 
+		//are temporary and will be replaced later on by permanent token and secret values
+		$this->Fitbit_model->add_newfitbit($userid, $results['oauth_token'], $results['oauth_token_secret']);
+
+		//OAUTH STEP 5 - The client redirects the user to Fitbit in order for the user to authorize the client application. C
+		//go to fitbit auth page
+		//this is where the user agrees to allowing you to connect to their information via the api
+		//when you setup your application in FitBit you include a return url - this is what is called with the permanent token and secret
+		$url = "https://fitbit.com/oauth/authorize?oauth_token=" . $results['oauth_token'];
+		redirect($url);
+	}
+	
+	// this function is the one that creates the encrypted curl string
+	function get_oauth_tempaccess() {
+		$url = "https://api.fitbit.com/oauth/request_token";
+	
+		$oauth = array( 'oauth_consumer_key' => $this->consumer_key,
+						'oauth_callback' => 'http://mobiletexthealth.com/fitbit/approved',
+						'oauth_nonce' => time(),
+						'oauth_signature_method' => 'HMAC-SHA1',
+						'oauth_timestamp' => time() - 100,	//-100 seems to fix the problem of sending a time ahead of fitbit's time
+						'oauth_version' => '1.0');
+						
+		//print_r($oauth); //used for debugging
+
+		$base_info = $this->buildBaseString($url, 'GET', $oauth);
+		$composite_key = rawurlencode($this->consumer_secret) . '&' . rawurlencode('');
+		$oauth_signature = base64_encode(hash_hmac('sha1', $base_info, $composite_key, true));
+		$oauth['oauth_signature'] = $oauth_signature;
+
+
+		$header = array($this->buildAuthorizationHeader($oauth), 'Expect:');
+		$options = array( CURLOPT_HTTPHEADER => $header,
+						  CURLOPT_HEADER => false,
+						  CURLOPT_URL => $url,
+						  CURLOPT_RETURNTRANSFER => true,
+						  CURLOPT_SSL_VERIFYPEER => false);
+
+		$feed = curl_init();
+		curl_setopt_array($feed, $options);
+		$json = curl_exec($feed);
+		curl_close($feed);
+
+		return $json;	// return the json results, the results include error messages, etc. that should be checked.
+	}
+//---------------------------------------------------------------------------------------------------------
+// -- OAUTH STEP 6 - The user approves the client application, and Fitbit redirects the user to the client application site, passing a verifier. D
+//---------------------------------------------------------------------------------------------------------		
+	function approved() {
+		// FitBit returns the temp token and the verifier code with that information you request the user's permanent token and secret codes
+		$oauth_token = $_GET['oauth_token'];
+		$oauth_verifier = $_GET['oauth_verifier'];
+	
+		// update the fitbit MySQL record - based on the temp oauth_token
+		$this->Fitbit_model->update_fitbit_by_oauth_token($oauth_token, $oauth_verifier);
+		
+		//get user so you can match the MySQL record once you get the permanent token and secret, you probably could
+		//add the temp fields to the record for matching, but I felt they were not needed long term so I used the UserID 
+		//that was mapped to my site's User table (you probably have a user table if your looking to get user fitbit information
+		$fitbit_user = $this->Fitbit_model->get_by_oauth_token($oauth_token);
+		
+		//OAUTH STEP 7 - The client requests and receives token credentials from Fitbit using the verifier it received. E and F
+		//get the permanent fitbit user token and token secret
+		$json = $this->get_fitbit_oauth_secret($oauth_token, $oauth_verifier, $fitbit_user);
+		//print_r($json);  // used for debugging
+		parse_str($json, $results);
+		
+		// update the FitBit MySQL record with the permanent token and token_secret - this replaces the temp data in the record
+		$this->Fitbit_model->update_fitbit_by_userid($fitbit_user->idUser, $results['oauth_token'], $results['oauth_token_secret'], $results['encoded_user_id']);
+		
+		//redirect to profile page
+		// this should be the page you direct the user to AFTER they are authorized and you have successully received the user's token and token_secret
+		// change to what is appropiate for your site OR display a happy success message
+		$url = base_url() . 'admin/profile';
+		redirect($url);
+	}
+	
+	// this function performs the encrypted curl call to FitBit to obtain the permanent token and token secret
+	function get_fitbit_oauth_secret($oauth_token, $oauth_verifier, $fitbit_user) {
+		$url = "https://api.fitbit.com/oauth/access_token";
+		
+		$oauth = array( 'oauth_consumer_key' => $this->consumer_key,
+						'oauth_nonce' => time(),
+						'oauth_signature_method' => 'HMAC-SHA1',						
+						'oauth_timestamp' => time() - 100,  // -100 for some reason gives timestamp within range
+						'oauth_token' => $oauth_token,
+						'oauth_verifier' => $oauth_verifier,
+						'oauth_version' => '1.0');
+
+		$base_info = $this->buildBaseString($url, 'GET', $oauth);
+		$composite_key = rawurlencode($this->consumer_secret) . '&' .rawurlencode($fitbit_user->oauth_token_secret);
+		$oauth_signature = base64_encode(hash_hmac('sha1', $base_info, $composite_key, true));
+		$oauth['oauth_signature'] = $oauth_signature;
+
+
+		$header = array($this->buildAuthorizationHeader($oauth), 'Expect:');
+		$options = array( CURLOPT_HTTPHEADER => $header,
+						  CURLOPT_HEADER => false,
+						  CURLOPT_URL => $url,
+						  CURLOPT_RETURNTRANSFER => true,
+						  CURLOPT_SSL_VERIFYPEER => false);
+
+		$feed = curl_init();
+		curl_setopt_array($feed, $options);
+		$json = curl_exec($feed);
+		curl_close($feed);
+
+		return $json;
+	
+	}
+	
+//---------------------------------------------------------------------------------------------------------
+// OAUTH STEP 8 - Using token credentials, the client makes calls to access Fitbit resources on behalf of the user. G
+// -- Getting User Data
+// 		at this point you've successfully obtained the user's token and token secret and can start 
+//		getting the user's FitBit data
+//		I used a central function get_users_fitbit_data to receive the site's calls and return the 
+//		specific fitbit api data, a full list of api's for FitBit can be found here: https://wiki.fitbit.com/display/API/Fitbit+Resource+Access+API
+//---------------------------------------------------------------------------------------------------------	
+	function get_users_fitbit_data($userid, $datatype) {
+		// init data	
+		$data = NULL;
+	
+		switch ($datatype) {
+			case 'today':
+				$data = $this->fitbitactivity_today($userid);
+				$msg = 'Today\'s (' . $data['date'] . ') FitBit update: you did ' . (string)$data['steps'] . ' steps and burnt ';
+				$msg .= (string)$data['activityCalories'] . ' calories!';
+				break;
+			case 'user_enabled':
+				$enabled = $this->User_model->is_user_fitbit($userid);
+				
+				if($enabled == true) {
+					$msg = 'enabled';
+				} else {
+					$msg = 'not enabled';
+				}
+		}	
+		
+		echo $msg;
+	}
+
+	function test_fitbit_msg() {
+		$url = 'http://mobiletexthealth.com/fitbit/get_users_fitbit_data/1/today';
+		$str = file_get_contents($url);
+		
+		echo 'Test: ' . $str;
+	}
+	
+	function fitbitactivity_total($userid) {
+		//set url for type of response
+		$url = "https://api.fitbit.com/1/user/-/activities.json" ;
+		
+		//make call
+		$json = $this->get_fitbituserdata($url, $userid);
+		
+		//print_r($this->prettyPrint($json));
+		
+		$results = json_decode($json, true);
+		print_r($results['lifetime']['total']['steps']);
+	}
+	
+	function fitbitactivity_today($userid) {
+		// get user's current date
+		$results = $this->User_model->get_user_currentdate($userid, '%Y-%m-%d');
+		$userdate = $results->UserDate;
+	
+		//set url for type of response
+		$url = "https://api.fitbit.com/1/user/-/activities/date/" . $userdate . ".json" ;
+		
+		//make call
+		$json = $this->get_fitbituserdata($url, $userid);
+		
+		//print_r($this->prettyPrint($json));
+		
+		$results = json_decode($json, true);
+				
+		$data = ARRAY(
+			'steps' => $results['summary']['steps']
+			,'activityCalories' => $results['summary']['activityCalories']
+			,'date' => date('Y-m-d', strtotime('yesterday'))
+		);
+		
+		return $data;
+	}
+	
+	function fitbitactivity_recent($userid) {
+		//set url for type of response
+		$url = "https://api.fitbit.com/1/user/-/activities/recent.json" ;
+		
+		//make call
+		$json = $this->get_fitbituserdata($url, $userid);
+		
+		//print_r($this->prettyPrint($json));
+		
+		$results = json_decode($json, true);
+		//print_r($results);
+		echo $url . '<br>';
+		print_r($results);
+	}
+
+	function fitbitactivity_stats($userid) {
+		//set url for type of response
+		$url = "https://api.fitbit.com/1/user/-/activities.json" ;
+		
+		//make call
+		$json = $this->get_fitbituserdata($url, $userid);
+		
+		//print_r($this->prettyPrint($json));
+		
+		$results = json_decode($json, true);
+		//print_r($results);
+		echo $url . '<br>';
+		//print_r($results);
+	}
+	
+	function get_fitbituserdata($url, $userid) {
+		//get user data
+		$fitbit_user = $this->Fitbit_model->get_by_userid($userid);
+	
+		$oauth_access_token = $fitbit_user->oauth_token;
+		$oauth_access_token_secret = $fitbit_user->oauth_token_secret;
+
+		$oauth = array( 'oauth_consumer_key' => $this->consumer_key,
+						'oauth_nonce' => time(),
+						'oauth_signature_method' => 'HMAC-SHA1',
+						'oauth_token' => $oauth_access_token,
+						'oauth_timestamp' => time() - 100,  // -100 for some reason gives timestamp within range
+						'oauth_version' => '1.0');
+
+		$base_info = $this->buildBaseString($url, 'GET', $oauth);
+		$composite_key = rawurlencode($this->consumer_secret) . '&' . rawurlencode($oauth_access_token_secret);
+		$oauth_signature = base64_encode(hash_hmac('sha1', $base_info, $composite_key, true));
+		$oauth['oauth_signature'] = $oauth_signature;
+
+
+		$header = array($this->buildAuthorizationHeader($oauth), 'Expect:');
+		$options = array( CURLOPT_HTTPHEADER => $header,
+						  CURLOPT_HEADER => false,
+						  CURLOPT_URL => $url,
+						  CURLOPT_RETURNTRANSFER => true,
+						  CURLOPT_SSL_VERIFYPEER => false);
+
+		$feed = curl_init();
+		curl_setopt_array($feed, $options);
+		$json = curl_exec($feed);
+		curl_close($feed);
+
+		return $json;
+	}
+	
+//---------------------------------------------------------------------------------------------------------
+// -- other fitbit maint functions
+//---------------------------------------------------------------------------------------------------------
+	
+	function remove_fitbit_by_userid($userid) {
+		// use this function to remove the fitbit records from your FitBit table
+		$this->Fitbit_model->delete_by_userid($userid);
+		
+		//redirect to profile
+		$url = base_url() . 'admin/profile';
+		redirect($url);
+	}
+
+//---------------------------------------------------------------------------------------------------------
+// -- general functions
+//---------------------------------------------------------------------------------------------------------
+	
+	function buildBaseString($baseURI, $method, $params) {
+		$r = array(); 
+		ksort($params); 
+		foreach($params as $key=>$value){
+			$r[] = "$key=" . rawurlencode($value); 
+		}            
+
+		return $method."&" . rawurlencode($baseURI) . '&' . rawurlencode(implode('&', $r)); //return complete base string
+	}
+
+	function buildAuthorizationHeader($oauth) {
+		$r = 'Authorization: OAuth ';
+		$values = array();
+		foreach($oauth as $key=>$value)
+			$values[] = "$key=\"" . rawurlencode($value) . "\""; 
+
+		$r .= implode(', ', $values); 
+		return $r; 
+	}
+
+
+}
